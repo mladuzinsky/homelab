@@ -1,0 +1,263 @@
+---
+# Creates a Fedora Cloud Base VM on Proxmox (the usual way to get an
+# automated, minimal Fedora Server-style guest). Runs `qm` on the Proxmox
+# node itself, so this play must target that host.
+#
+# Prerequisites on the Proxmox host:
+#   - proxmox_vm_storage must allow "Disk image" content
+#   - proxmox_snippet_storage (default "local") must allow "Snippets"
+#     Datacenter -> Storage -> <storage> -> Content
+#   - openssl is installed (used to hash the admin password)
+#
+# Layout:
+#   playbooks/create_fedora_vm.yml
+#   playbooks/templates/fedora-cloud-init-userdata.yml.j2
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.yml playbooks/create_fedora_vm.yml
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/create_fedora_vm.yml \
+#     -e vm_id=110 -e vm_admin_password='ChangeMe123!'
+#
+# Recreate a half-finished VM:
+#   ansible-playbook -i inventory/hosts.yml playbooks/create_fedora_vm.yml \
+#     -e vm_force_recreate=true
+
+- name: Create a Fedora Server VM on Proxmox
+  hosts: proxmox
+  become: true
+  gather_facts: false
+
+  vars:
+    vm_id: 9000
+    vm_name: fedoratemp
+    vm_cores: 2
+    vm_memory: 2048
+    vm_disk_size: 20G
+    vm_cpu_type: host
+    vm_force_recreate: false
+
+    vm_bridge: vmbr0
+    vm_ip: 192.168.1.11
+    vm_cidr: 24
+    vm_gateway: 192.168.1.1
+    vm_dns: 192.168.1.1
+
+    vm_admin_user: admin
+    vm_admin_password: admin
+    vm_password_salt: fedoratemp-salt
+    vm_ssh_pubkey: ""
+    vm_expire_password: true
+
+    proxmox_vm_storage: local-lvm
+    proxmox_snippet_storage: local
+    proxmox_snippet_dir: /var/lib/vz/snippets
+    proxmox_image_download_dir: /var/tmp/fedora-cloud-images
+
+    # If this 404s, update filename + sha256 from:
+    # https://fedoraproject.org/cloud/download
+    fedora_version: "44"
+    fedora_image_filename: "Fedora-Cloud-Base-Generic-{{ fedora_version }}-1.7.x86_64.qcow2"
+    fedora_image_url: "https://download.fedoraproject.org/pub/fedora/linux/releases/{{ fedora_version }}/Cloud/x86_64/images/{{ fedora_image_filename }}"
+    fedora_image_sha256: "28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f"
+
+  tasks:
+    - name: Check whether the VM already exists
+      ansible.builtin.command:
+        argv: [qm, status, "{{ vm_id }}"]
+      register: vm_status
+      changed_when: false
+      failed_when: false
+
+    - name: Stop the existing VM before recreate
+      ansible.builtin.command:
+        argv: [qm, stop, "{{ vm_id }}"]
+      when:
+        - vm_force_recreate | bool
+        - vm_status.rc == 0
+      failed_when: false
+      changed_when: true
+
+    - name: Destroy the existing VM before recreate
+      ansible.builtin.command:
+        argv: [qm, destroy, "{{ vm_id }}", "--purge", "1"]
+      when:
+        - vm_force_recreate | bool
+        - vm_status.rc == 0
+      register: vm_destroy
+      failed_when: false
+      changed_when: vm_destroy.rc == 0
+
+    - name: Re-check VM existence after optional destroy
+      ansible.builtin.command:
+        argv: [qm, status, "{{ vm_id }}"]
+      register: vm_status
+      changed_when: false
+      failed_when: false
+
+    - name: Report and skip if the VM already exists
+      ansible.builtin.debug:
+        msg: >-
+          VM {{ vm_id }} ({{ vm_name }}) already exists — skipping creation.
+          Re-run with -e vm_force_recreate=true to rebuild it.
+      when: vm_status.rc == 0
+
+    - name: Create and start the Fedora VM
+      when: vm_status.rc != 0
+      block:
+        - name: Generate a SHA-512 hash for the admin password
+          ansible.builtin.command:
+            argv:
+              - openssl
+              - passwd
+              - "-6"
+              - -salt
+              - "{{ vm_password_salt }}"
+              - "{{ vm_admin_password }}"
+          register: admin_password_hash
+          changed_when: false
+          no_log: true
+
+        - name: Ensure the cloud-init snippets directory exists
+          ansible.builtin.file:
+            path: "{{ proxmox_snippet_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Render the cloud-init user-data snippet
+          ansible.builtin.template:
+            src: "{{ playbook_dir }}/templates/fedora-cloud-init-userdata.yml.j2"
+            dest: "{{ proxmox_snippet_dir }}/{{ vm_name }}-user-data.yaml"
+            mode: "0600"
+
+        - name: Ensure the image download directory exists
+          ansible.builtin.file:
+            path: "{{ proxmox_image_download_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Download the Fedora Cloud Base image
+          ansible.builtin.get_url:
+            url: "{{ fedora_image_url }}"
+            dest: "{{ proxmox_image_download_dir }}/{{ fedora_image_filename }}"
+            checksum: "sha256:{{ fedora_image_sha256 }}"
+            mode: "0644"
+
+        - name: Create the VM shell
+          ansible.builtin.command:
+            argv:
+              - qm
+              - create
+              - "{{ vm_id }}"
+              - --name
+              - "{{ vm_name }}"
+              - --memory
+              - "{{ vm_memory }}"
+              - --cores
+              - "{{ vm_cores }}"
+              - --cpu
+              - "{{ vm_cpu_type }}"
+              - --net0
+              - "virtio,bridge={{ vm_bridge }}"
+              - --scsihw
+              - virtio-scsi-pci
+              - --ostype
+              - l26
+              - --agent
+              - enabled=1
+
+        - name: Import the Fedora cloud disk image into VM storage
+          ansible.builtin.command:
+            argv:
+              - qm
+              - importdisk
+              - "{{ vm_id }}"
+              - "{{ proxmox_image_download_dir }}/{{ fedora_image_filename }}"
+              - "{{ proxmox_vm_storage }}"
+
+        - name: Read back the VM config to find the imported disk
+          ansible.builtin.command:
+            argv: [qm, config, "{{ vm_id }}"]
+          register: vm_config
+          changed_when: false
+
+        - name: Capture the unused imported disk volume
+          ansible.builtin.set_fact:
+            imported_disk: "{{ vm_config.stdout | regex_search('unused0:\\s*(\\S+)', '\\1') }}"
+
+        - name: Fail if the imported disk was not found
+          ansible.builtin.fail:
+            msg: >-
+              Could not find unused0 in `qm config {{ vm_id }}`.
+              Config was:
+              {{ vm_config.stdout }}
+          when: imported_disk is not string or imported_disk | length == 0
+
+        - name: Attach the imported disk as scsi0
+          ansible.builtin.command:
+            argv:
+              - qm
+              - set
+              - "{{ vm_id }}"
+              - --scsi0
+              - "{{ imported_disk }}"
+
+        - name: Grow the disk to the target size
+          ansible.builtin.command:
+            argv: [qm, resize, "{{ vm_id }}", scsi0, "{{ vm_disk_size }}"]
+
+        - name: Attach a cloud-init drive
+          ansible.builtin.command:
+            argv:
+              - qm
+              - set
+              - "{{ vm_id }}"
+              - --ide2
+              - "{{ proxmox_vm_storage }}:cloudinit"
+
+        - name: Set boot order and serial console
+          ansible.builtin.command:
+            argv:
+              - qm
+              - set
+              - "{{ vm_id }}"
+              - --boot
+              - order=scsi0
+              - --serial0
+              - socket
+              - --vga
+              - serial0
+
+        - name: Configure the static IP via cloud-init
+          ansible.builtin.command:
+            argv:
+              - qm
+              - set
+              - "{{ vm_id }}"
+              - --ipconfig0
+              - "ip={{ vm_ip }}/{{ vm_cidr }},gw={{ vm_gateway }}"
+              - --nameserver
+              - "{{ vm_dns }}"
+              - --ciuser
+              - "{{ vm_admin_user }}"
+
+        - name: Point the VM at the custom cloud-init user-data
+          ansible.builtin.command:
+            argv:
+              - qm
+              - set
+              - "{{ vm_id }}"
+              - --cicustom
+              - "user={{ proxmox_snippet_storage }}:snippets/{{ vm_name }}-user-data.yaml"
+
+        - name: Start the VM
+          ansible.builtin.command:
+            argv: [qm, start, "{{ vm_id }}"]
+
+        - name: Summary
+          ansible.builtin.debug:
+            msg: >-
+              VM {{ vm_id }} ({{ vm_name }}) created and started.
+              IP {{ vm_ip }}/{{ vm_cidr }}, user {{ vm_admin_user }}.
+              {{ 'Password must be changed on first login.' if vm_expire_password | bool else 'Password login is enabled.' }}
+              {{ 'SSH key was injected.' if vm_ssh_pubkey | length > 0 else 'No SSH public key was provided.' }}
