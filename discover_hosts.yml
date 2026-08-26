@@ -1,0 +1,224 @@
+---
+# Discover SSH-reachable hosts on the home network and write them into
+# inventory/discovered.yml grouped by OS (e.g. fedora, ubuntu, debian).
+#
+# This never touches inventory/hosts.yml — your hand-curated inventory is
+# left alone. inventory/discovered.yml is fully regenerated (overwritten)
+# every run. Treat anything found there as "new, needs review": move a host
+# into hosts.yml if you want to keep it with custom vars.
+#
+# Requires nmap on the control node. This play runs against implicit
+# localhost, so no inventory file is required to run it.
+#
+# Usage:
+#   ansible-playbook playbooks/discover_hosts.yml
+#   ansible-playbook playbooks/discover_hosts.yml -e network_cidr=192.168.1.0/24
+#   ansible-playbook playbooks/discover_hosts.yml -e '{"discovery_ssh_users":["root","ansible"]}'
+#
+# Then, to use the merged result (hand-curated + discovered):
+#   ansible-playbook -i inventory/ playbooks/site.yml
+
+- name: Discover SSH-reachable hosts on the home network
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    network_cidr: 192.168.1.0/24
+    ssh_port: 22
+    exclude_ips: []
+    # Tried in order until BatchMode SSH succeeds (key-based auth only).
+    discovery_ssh_users:
+      - root
+      - ansible
+      - admin
+      - ubuntu
+      - debian
+    discovery_ssh_common_args: "-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5"
+    discovered_inventory_path: "{{ playbook_dir }}/../inventory/discovered.yml"
+
+  tasks:
+    - name: Confirm nmap is installed on the control node
+      ansible.builtin.command: which nmap
+      register: nmap_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail with install instructions if nmap is missing
+      ansible.builtin.fail:
+        msg: >-
+          nmap is required for network discovery but was not found.
+          Install it first, e.g.
+          {{ 'sudo dnf install -y nmap' if ansible_facts.os_family == 'RedHat'
+             else 'sudo apt-get install -y nmap' if ansible_facts.os_family == 'Debian'
+             else 'sudo pacman -S --noconfirm nmap' if ansible_facts.os_family == 'Archlinux'
+             else 'nmap (use your distro package manager)' }}
+      when: nmap_check.rc != 0
+
+    - name: Scan the network for hosts with SSH open
+      ansible.builtin.command:
+        argv:
+          - nmap
+          - -n
+          - -T4
+          - --max-retries
+          - "1"
+          - --host-timeout
+          - 5s
+          - -p
+          - "{{ ssh_port | string }}"
+          - --open
+          - -oG
+          - "-"
+          - "{{ network_cidr }}"
+      register: nmap_scan
+      changed_when: false
+
+    - name: Extract IPs with SSH open from the scan
+      ansible.builtin.set_fact:
+        discovered_ips: "{{ scanned_ips | difference(exclude_ips | default([])) | unique }}"
+      vars:
+        scanned_ips: >-
+          {{ nmap_scan.stdout_lines
+             | select('search', '/open')
+             | map('regex_search', 'Host:\\s+(\\d{1,3}(?:\\.\\d{1,3}){3})', '\\1')
+             | select('string')
+             | list }}
+
+    - name: Report scan results
+      ansible.builtin.debug:
+        msg: >-
+          {{ discovered_ips | length }} host(s) with port {{ ssh_port }}
+          open: {{ discovered_ips }}
+
+    - name: Skip SSH probe when no hosts were found
+      ansible.builtin.meta: end_play
+      when: discovered_ips | length == 0
+
+    - name: Probe which SSH user works for each discovered IP
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -p
+          - "{{ ssh_port | string }}"
+          - -o
+          - StrictHostKeyChecking=accept-new
+          - -o
+          - BatchMode=yes
+          - -o
+          - ConnectTimeout=5
+          - "{{ item.1 }}@{{ item.0 }}"
+          - true
+      loop: "{{ discovered_ips | product(discovery_ssh_users) | list }}"
+      loop_control:
+        label: "{{ item.1 }}@{{ item.0 }}"
+      register: ssh_probes
+      changed_when: false
+      failed_when: false
+
+    - name: Map each IP to the first working SSH user
+      ansible.builtin.set_fact:
+        discovered_targets: "{{ discovered_targets | default([]) + [target] }}"
+      loop: "{{ discovered_ips }}"
+      vars:
+        matching_probes: "{{ ssh_probes.results | selectattr('item.0', 'equalto', item) | list }}"
+        working_probe: "{{ matching_probes | selectattr('rc', 'equalto', 0) | list | first | default({}) }}"
+        target:
+          ip: "{{ item }}"
+          user: "{{ working_probe.item.1 | default('') }}"
+          reachable: "{{ working_probe.rc is defined and working_probe.rc == 0 }}"
+
+    - name: Report hosts that accepted an SSH key
+      ansible.builtin.debug:
+        msg: >-
+          Reachable via key:
+          {{ discovered_targets | selectattr('reachable') | map(attribute='ip') | list }}
+          Unreachable (port open, no matching key/user):
+          {{ discovered_targets | rejectattr('reachable') | map(attribute='ip') | list }}
+
+    - name: Register reachable hosts for fact gathering
+      ansible.builtin.add_host:
+        name: "disc-{{ item.ip | replace('.', '-') }}"
+        groups: discovered_hosts
+        ansible_host: "{{ item.ip }}"
+        ansible_user: "{{ item.user }}"
+        ansible_port: "{{ ssh_port }}"
+        ansible_ssh_common_args: "{{ discovery_ssh_common_args }}"
+        discovered_ip: "{{ item.ip }}"
+        discovered_user: "{{ item.user }}"
+      loop: "{{ discovered_targets | selectattr('reachable') | list }}"
+      loop_control:
+        label: "{{ item.user }}@{{ item.ip }}"
+
+    - name: Persist discovery results for later plays
+      ansible.builtin.set_fact:
+        network_cidr: "{{ network_cidr }}"
+        discovered_inventory_path: "{{ discovered_inventory_path }}"
+        discovered_ips: "{{ discovered_ips }}"
+        discovered_targets: "{{ discovered_targets | default([]) }}"
+        discovery_ssh_port: "{{ ssh_port }}"
+
+- name: Gather facts from discovered hosts
+  hosts: discovered_hosts
+  gather_facts: true
+  ignore_unreachable: true
+  ignore_errors: true
+  vars:
+    ansible_python_interpreter: auto_silent
+
+- name: Build the OS-grouped discovered inventory
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Classify each reachable discovered host by OS
+      ansible.builtin.set_fact:
+        classified_hosts: "{{ (classified_hosts | default([])) + [record] }}"
+      loop: "{{ groups['discovered_hosts'] | default([]) }}"
+      vars:
+        hv: "{{ hostvars[item] }}"
+        facts_ok: "{{ hv.ansible_facts is defined and hv.ansible_distribution is defined }}"
+        raw_os_key: "{{ hv.ansible_distribution if facts_ok else 'unclassified' }}"
+        raw_name: "{{ hv.ansible_hostname | default(hv.discovered_ip) }}"
+        safe_name: "{{ raw_name | lower | regex_replace('[^a-z0-9_]+', '_') }}"
+        record:
+          inventory_name: "{{ safe_name }}"
+          ip: "{{ hv.discovered_ip }}"
+          user: "{{ hv.discovered_user | default('root') }}"
+          os_key: "{{ raw_os_key | lower | regex_replace('[^a-z0-9_]+', '_') }}"
+          distribution: "{{ hv.ansible_distribution | default('') }}"
+          version: "{{ hv.ansible_distribution_version | default('') }}"
+          os_family: "{{ hv.ansible_os_family | default('') }}"
+
+    - name: Make inventory hostnames unique when collisions exist
+      ansible.builtin.set_fact:
+        unique_hosts: "{{ (unique_hosts | default([])) + [adjusted] }}"
+      loop: "{{ classified_hosts | default([]) }}"
+      vars:
+        name_count: "{{ classified_hosts | default([]) | selectattr('inventory_name', 'equalto', item.inventory_name) | list | length }}"
+        ip_suffix: "{{ item.ip.split('.')[-1] }}"
+        adjusted: "{{ item | combine({'inventory_name': item.inventory_name ~ '_' ~ ip_suffix}) if (name_count | int) > 1 else item }}"
+
+    - name: Ensure inventory directory exists
+      ansible.builtin.file:
+        path: "{{ hostvars['localhost'].discovered_inventory_path | dirname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write inventory/discovered.yml
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/discovered-inventory.yml.j2"
+        dest: "{{ hostvars['localhost'].discovered_inventory_path }}"
+        mode: "0644"
+      vars:
+        unique_hosts: "{{ unique_hosts | default([]) }}"
+        network_cidr: "{{ hostvars['localhost'].network_cidr }}"
+        generated_at: "{{ lookup('pipe', 'date -Iseconds') }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          Wrote {{ unique_hosts | default([]) | length }} classified host(s) to
+          {{ hostvars['localhost'].discovered_inventory_path }},
+          grouped by: {{ (unique_hosts | default([])) | map(attribute='os_key') | unique | list }}
