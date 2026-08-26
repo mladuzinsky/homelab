@@ -4,7 +4,7 @@ Ansible setup and automation for managing the servers and IoT devices on my home
 
 ## Goals
 
-- Bootstrap Ansible onto a fresh control node regardless of Linux distro
+- Install Ansible onto a fresh control node regardless of Linux distro
 - Maintain a single inventory of all home servers and IoT devices
 - Use playbooks/roles to configure, update, and manage those hosts consistently
 
